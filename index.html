@@ -8,7 +8,6 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/pizzip@3.1.4/dist/pizzip.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/docxtemplater@3.50.0/build/docxtemplater.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js"></script>
     <style>
@@ -45,6 +44,75 @@
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 
     <script>
+        // ── 替换 docx 模板中的 {{name}} ──────────────────────────────────────
+        // Word 保存时会把 {{name}} 拆成多个 XML 运行块（<w:r>），需要先合并再替换
+        function replaceNameInXml(xml, escapedName) {
+            // 先直接替换（{{name}} 在同一个 w:t 中）
+            if (xml.includes('{{name}}')) {
+                return xml.replace(/\{\{name\}\}/g, escapedName);
+            }
+
+            // 如果直接替换找不到，说明被拆散在多个 <w:r> 里
+            // 逐段落（<w:p>）处理，合并含有占位符碎片的运行块
+            return xml.replace(/(<w:p[ >\/][\s\S]*?<\/w:p>)/g, para => {
+                // 提取段落内所有 <w:t> 的文本
+                const wts = [];
+                para.replace(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g, (_, t) => wts.push(t));
+                const combined = wts.join('');
+                if (!combined.includes('{{name}}')) return para;
+
+                // 提取所有 <w:r>
+                const runs = [];
+                para.replace(/<w:r[ >][\s\S]*?<\/w:r>/g, m => runs.push(m));
+                if (runs.length === 0) return para;
+
+                const runTexts = runs.map(r => {
+                    const m = r.match(/<w:t[^>]*>([\s\S]*?)<\/w:t>/);
+                    return m ? m[1] : '';
+                });
+
+                // 找到覆盖 {{name}} 的最小运行块范围 [i, j]
+                for (let i = 0; i < runTexts.length; i++) {
+                    let acc = '';
+                    for (let j = i; j < runTexts.length; j++) {
+                        acc += runTexts[j];
+                        if (acc.includes('{{name}}')) {
+                            // 把 runs[i..j] 合并为一个运行块，替换占位符
+                            const rprM = runs[i].match(/(<w:rPr>[\s\S]*?<\/w:rPr>)/);
+                            const rpr = rprM ? rprM[1] : '';
+                            const newText = acc.replace(/\{\{name\}\}/g, escapedName);
+                            const newRun = `<w:r>${rpr}<w:t xml:space="preserve">${newText}</w:t></w:r>`;
+                            let result = para.replace(runs[i], newRun);
+                            for (let k = i + 1; k <= j; k++) result = result.replace(runs[k], '');
+                            return result;
+                        }
+                    }
+                }
+                return para;
+            });
+        }
+
+        function generateDocxBuffer(templateArrayBuffer, name) {
+            const escaped = name
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+
+            const zip = new PizZip(templateArrayBuffer);
+
+            // 处理正文 + 页眉 + 页脚
+            Object.keys(zip.files)
+                .filter(f => /^word\/(document|header\d*|footer\d*)\.xml$/.test(f))
+                .forEach(filename => {
+                    const file = zip.file(filename);
+                    if (!file) return;
+                    zip.file(filename, replaceNameInXml(file.asText(), escaped));
+                });
+
+            return zip.generate({ type: 'arraybuffer' });
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         const { useState } = React;
         const { createElement: h } = React;
 
@@ -397,22 +465,11 @@
                         templateData = await resp.arrayBuffer();
                     }
 
-                    // 获取 docxtemplater 构造函数（兼容大小写）
-                    const DocxTemplater = window.docxtemplater || window.Docxtemplater;
-                    if (!DocxTemplater) throw new Error('docxtemplater 库加载失败，请刷新页面重试');
-
                     const jszip = new JSZip();
 
                     for (let i = 0; i < allNames.length; i++) {
                         const name = allNames[i];
-                        const pizzip = new PizZip(templateData);
-                        const doc = new DocxTemplater(pizzip, {
-                            paragraphLoop: true,
-                            linebreaks: true,
-                        });
-                        doc.render({ name: name });
-                        const buf = doc.getZip().generate({ type: 'arraybuffer' });
-                        // 文件名中替换非法字符
+                        const buf = generateDocxBuffer(templateData, name);
                         const safeFilename = name.replace(/[\\/:*?"<>|]/g, '_');
                         jszip.file(`${safeFilename}.docx`, buf);
                         setProgress(Math.round(((i + 1) / allNames.length) * 100));
@@ -422,11 +479,7 @@
                     saveAs(blob, '证书合集.zip');
                     setStep(4);
                 } catch (err) {
-                    if (err.properties && err.properties.errors) {
-                        setError('模板处理错误：请确认模板 .docx 文件中包含 {{name}} 占位符，且格式正确');
-                    } else {
-                        setError(err.message || '生成失败，请检查模板文件格式');
-                    }
+                    setError(err.message || '生成失败，请检查模板文件格式');
                     console.error(err);
                 } finally {
                     setGenerating(false);
