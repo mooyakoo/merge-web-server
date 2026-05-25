@@ -111,10 +111,8 @@
             const sectPr = sectPrMatch ? sectPrMatch[0] : '';
             const bodyCore = fullBody.replace(/<w:sectPr\b[\s\S]*<\/w:sectPr>/, '').trim();
 
-            // 分页符
-            const pageBreak = '<w:p><w:r><w:br w:type="page"/></w:r></w:p>';
-
-            // 为每个姓名替换占位符，拼接在一起
+            // 为每个姓名替换占位符，直接拼接（不插分页符）
+            // 模板内容满页后下一份自然从新页开始，与 docxcompose 行为一致
             const parts = names.map(name => {
                 const escaped = name
                     .replace(/&/g, '&amp;')
@@ -125,7 +123,7 @@
 
             const newDocXml = templateXml.replace(
                 /<w:body>[\s\S]*?<\/w:body>/,
-                `<w:body>${parts.join(pageBreak)}${sectPr}</w:body>`
+                `<w:body>${parts.join('')}${sectPr}</w:body>`
             );
 
             zip.file('word/document.xml', newDocXml);
