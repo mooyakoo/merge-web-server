@@ -8,7 +8,6 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/pizzip@3.1.4/dist/pizzip.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js"></script>
     <style>
         body {
@@ -92,23 +91,44 @@
             });
         }
 
-        function generateDocxBuffer(templateArrayBuffer, name) {
-            const escaped = name
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;');
+        // 将所有姓名合并进同一个 .docx，每人一页（与原始 Python 版本行为一致）
+        function mergeAllIntoDocx(templateArrayBuffer, names) {
+            if (names.length === 0) throw new Error('没有可生成的姓名');
 
             const zip = new PizZip(templateArrayBuffer);
+            const docFile = zip.file('word/document.xml');
+            if (!docFile) throw new Error('无效的 Word 文档，找不到 document.xml');
 
-            // 处理正文 + 页眉 + 页脚
-            Object.keys(zip.files)
-                .filter(f => /^word\/(document|header\d*|footer\d*)\.xml$/.test(f))
-                .forEach(filename => {
-                    const file = zip.file(filename);
-                    if (!file) return;
-                    zip.file(filename, replaceNameInXml(file.asText(), escaped));
-                });
+            const templateXml = docFile.asText();
 
+            // 提取 <w:body> 内容
+            const bodyMatch = templateXml.match(/<w:body>([\s\S]*)<\/w:body>/);
+            if (!bodyMatch) throw new Error('无法解析文档正文（<w:body>）');
+            const fullBody = bodyMatch[1];
+
+            // sectPr（页面设置）必须放在 <w:body> 最末尾，单独提取
+            const sectPrMatch = fullBody.match(/<w:sectPr\b[\s\S]*<\/w:sectPr>/);
+            const sectPr = sectPrMatch ? sectPrMatch[0] : '';
+            const bodyCore = fullBody.replace(/<w:sectPr\b[\s\S]*<\/w:sectPr>/, '').trim();
+
+            // 分页符
+            const pageBreak = '<w:p><w:r><w:br w:type="page"/></w:r></w:p>';
+
+            // 为每个姓名替换占位符，拼接在一起
+            const parts = names.map(name => {
+                const escaped = name
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;');
+                return replaceNameInXml(bodyCore, escaped);
+            });
+
+            const newDocXml = templateXml.replace(
+                /<w:body>[\s\S]*?<\/w:body>/,
+                `<w:body>${parts.join(pageBreak)}${sectPr}</w:body>`
+            );
+
+            zip.file('word/document.xml', newDocXml);
             return zip.generate({ type: 'arraybuffer' });
         }
         // ─────────────────────────────────────────────────────────────────────
@@ -465,18 +485,14 @@
                         templateData = await resp.arrayBuffer();
                     }
 
-                    const jszip = new JSZip();
-
-                    for (let i = 0; i < allNames.length; i++) {
-                        const name = allNames[i];
-                        const buf = generateDocxBuffer(templateData, name);
-                        const safeFilename = name.replace(/[\\/:*?"<>|]/g, '_');
-                        jszip.file(`${safeFilename}.docx`, buf);
-                        setProgress(Math.round(((i + 1) / allNames.length) * 100));
-                    }
-
-                    const blob = await jszip.generateAsync({ type: 'blob' });
-                    saveAs(blob, '证书合集.zip');
+                    setProgress(10);
+                    const buf = mergeAllIntoDocx(templateData, allNames);
+                    setProgress(95);
+                    const blob = new Blob([buf], {
+                        type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                    });
+                    saveAs(blob, '证书合集.docx');
+                    setProgress(100);
                     setStep(4);
                 } catch (err) {
                     setError(err.message || '生成失败，请检查模板文件格式');
@@ -763,7 +779,7 @@
                                     className: 'flex-1 px-6 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition disabled:bg-gray-400 flex items-center justify-center'
                                 }, generating
                                     ? [h('div', { key: 'spinner', className: 'animate-spin rounded-full h-5 w-5 border-b-2 border-white mr-2' }), `生成中... ${progress}%`]
-                                    : [h(Icons.Download, { key: 'icon', size: 20, className: 'mr-2' }), '生成证书压缩包'])
+                                    : [h(Icons.Download, { key: 'icon', size: 20, className: 'mr-2' }), '生成证书合集.docx'])
                             ),
                             h('div', { className: 'mt-4 p-3 bg-blue-50 border border-blue-200 rounded-lg' },
                                 h('p', { className: 'text-xs text-blue-800' }, '💡 所有处理均在您的浏览器本地完成，文件不会上传到任何服务器')
@@ -772,9 +788,9 @@
                         step === 4 && h('div', { className: 'text-center' },
                             h(Icons.CheckCircle, { size: 64, className: 'mx-auto mb-4 text-green-600' }),
                             h('h2', { className: 'text-2xl font-bold mb-4' }, '生成完成！'),
-                            h('p', { className: 'text-gray-600 mb-2' }, '证书压缩包已成功下载'),
-                            h('p', { className: 'text-sm text-gray-500 mb-2' }, h('strong', {}, '证书合集.zip'), ' 已保存到您的下载目录'),
-                            h('p', { className: 'text-sm text-gray-500 mb-6' }, `共 ${allNames.length} 个独立证书文件（每人一份 .docx）`),
+                            h('p', { className: 'text-gray-600 mb-2' }, '证书文档已成功下载'),
+                            h('p', { className: 'text-sm text-gray-500 mb-2' }, h('strong', {}, '证书合集.docx'), ' 已保存到您的下载目录'),
+                            h('p', { className: 'text-sm text-gray-500 mb-6' }, `共 ${allNames.length} 页证书，每页一人`),
                             h('button', {
                                 onClick: () => {
                                     setStep(1);
@@ -797,8 +813,8 @@
                             h('li', {}, h('strong', {}, '1.'), ' 准备 .docx 证书模板，将姓名处替换为 ', h('code', { className: 'bg-gray-100 px-1 rounded' }, '{{name}}'), ' 占位符'),
                             h('li', {}, h('strong', {}, '2.'), ' 上传模板文件 + 姓名文件（Excel 或 TXT）'),
                             h('li', {}, h('strong', {}, '3.'), ' Excel：系统自动识别姓名列，可切换手动模式调整'),
-                            h('li', {}, h('strong', {}, '4.'), ' 确认姓名列表后点击生成，下载 ', h('code', { className: 'bg-gray-100 px-1 rounded' }, '证书合集.zip')),
-                            h('li', {}, h('strong', {}, '5.'), ' 解压 ZIP，每位姓名对应一个独立的 .docx 证书文件')
+                            h('li', {}, h('strong', {}, '4.'), ' 确认姓名列表后点击生成，下载 ', h('code', { className: 'bg-gray-100 px-1 rounded' }, '证书合集.docx')),
+                            h('li', {}, h('strong', {}, '5.'), ' 文档内每页一人，顺序与名单一致')
                         ),
                         h('div', { className: 'mt-4 p-3 bg-blue-50 rounded-lg space-y-1' },
                             h('p', { className: 'text-xs text-blue-800' }, '💡 ', h('strong', {}, '智能识别关键词：'), '姓名、name、名字、名称、学生姓名、学生、人员、员工'),
